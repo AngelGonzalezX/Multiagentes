@@ -1,46 +1,54 @@
-from google.adk.agents import Agent, LoopAgent, SequentialAgent
+from google.adk.agents import Agent, LoopAgent, SequentialAgent, BaseAgent
 from google.adk.agents.invocation_context import InvocationContext
-from google.adk.agents.base_agent import BaseAgent
 from google.adk.events import Event, EventActions
 from typing import AsyncGenerator
+from pydantic import BaseModel, Field
+from typing import Literal
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
 
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.0-flash-lite"
 
-# Conexión al Researcher (puerto 8001)
-from google.adk.agents import RemoteA2aAgent
-
-def create_save_output_callback(key: str):
-    async def callback(ctx: InvocationContext, output: str):
-        ctx.session.state[key] = output
-    return callback
-
-researcher = RemoteA2aAgent(
+# Agente Researcher
+researcher = Agent(
     name="researcher",
-    agent_card="http://localhost:8001/a2a/agent/.well-known/agent-card.json",
-    description="Gathers information using Google Search.",
-    after_agent_callback=create_save_output_callback("research_findings"),
+    model=MODEL,
+    description="Gathers information on a topic using Google Search.",
+    instruction="""
+    You are an expert researcher. Your goal is to find comprehensive and accurate information on the user's topic.
+    Summarize your findings clearly.
+    If you receive feedback that your research is insufficient, use the feedback to refine your next search.
+    DO NOT output any function calls. Provide your research directly as text.
+    """,
 )
 
-# Conexión al Judge (puerto 8002)
-judge = RemoteA2aAgent(
+# Schema del Judge
+class JudgeFeedback(BaseModel):
+    status: Literal["pass", "fail"] = Field(
+        description="Whether the research is sufficient ('pass') or needs more work ('fail')."
+    )
+    feedback: str = Field(
+        description="Detailed feedback on what is missing. If 'pass', a brief confirmation."
+    )
+
+# Agente Judge
+judge = Agent(
     name="judge",
-    agent_card="http://localhost:8002/a2a/agent/.well-known/agent-card.json",
-    description="Evaluates research.",
-    after_agent_callback=create_save_output_callback("judge_feedback"),
+    model=MODEL,
+    description="Evaluates research findings for completeness and accuracy.",
+    instruction="""
+    You are a strict editor.
+    Evaluate the research findings against the user's original request.
+    If the findings are missing key info, return status='fail'.
+    If they are comprehensive, return status='pass'.
+    """,
+    output_schema=JudgeFeedback,
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
 )
 
-# Conexión al Content Builder (puerto 8003)
-content_builder = RemoteA2aAgent(
-    name="content_builder",
-    agent_card="http://localhost:8003/a2a/agent/.well-known/agent-card.json",
-    description="Builds the course.",
-)
-
-# EscalationChecker — lógica pura en Python, sin LLM
+# EscalationChecker
 class EscalationChecker(BaseAgent):
     async def _run_async_impl(
         self, ctx: InvocationContext
@@ -61,7 +69,26 @@ class EscalationChecker(BaseAgent):
 
 escalation_checker = EscalationChecker(name="escalation_checker")
 
-# LoopAgent — bucle de investigación
+# Agente Content Builder
+content_builder = Agent(
+    name="content_builder",
+    model=MODEL,
+    description="Transforms research findings into a structured course.",
+    instruction="""
+    You are an expert course creator.
+    Take the approved research findings and transform them into a well-structured, engaging course module.
+
+    **Formatting Rules:**
+    1. Start with a main title using a single `#` (H1).
+    2. Use `##` (H2) for main section headings.
+    3. Use bullet points and clear paragraphs.
+    4. Maintain a professional but engaging tone.
+
+    Ensure the content directly addresses the user's original request.
+    """,
+)
+
+# Loop de investigación
 research_loop = LoopAgent(
     name="research_loop",
     description="Iteratively researches and judges until quality standards are met.",
@@ -69,7 +96,7 @@ research_loop = LoopAgent(
     max_iterations=3,
 )
 
-# SequentialAgent — pipeline completo
+# Pipeline completo
 root_agent = SequentialAgent(
     name="course_creation_pipeline",
     description="A pipeline that researches a topic and then builds a course from it.",
